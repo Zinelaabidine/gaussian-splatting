@@ -76,8 +76,7 @@ def update_db(table, job_id, iteration, total_iterations, message="Training in p
             Key={'jobId': job_id},
             UpdateExpression="SET #s = :status, current_stage = :stage, overall_progress = :op, steps.#step = :step_data",
             ExpressionAttributeNames={
-                '#s': 'status',
-                '#step': 'gaussian_splat'
+                '#s': 'status'  
             },
             ExpressionAttributeValues={
                 ':status': 'RUNNING',
