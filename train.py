@@ -22,6 +22,10 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import time
+import boto3
+from decimal import Decimal
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,10 +44,67 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+# DynamoDB Configuration
+REGION = 'eu-north-1'  # Change if your table is in a different region
+TABLE_NAME = 'Jobs'
+UPDATE_INTERVAL = 100  # Update DB every N iterations
+
+def update_db(table, job_id, iteration, total_iterations, message="Training in progress"):
+    """
+    Updates DynamoDB with Gaussian Splatting progress.
+    """
+    try:
+        # Calculate step progress (0-100)
+        step_progress = min(100, int((iteration / total_iterations) * 100))
+        
+        # Define the nested step object
+        step_data = {
+            "status": "RUNNING" if step_progress < 100 else "COMPLETED",
+            "progress": step_progress,
+            "message": f"Iteration {iteration}/{total_iterations} - {message}",
+            "updated_at": str(int(time.time()))
+        }
+
+        # Calculate overall progress (assuming Gaussian Splatting is 60% of total pipeline)
+        # Adjust the base_progress if this stage starts after preprocessing
+        base_progress = 20  # If preprocessing (20%) is done
+        stage_weight = 0.6  # Gaussian Splatting is 60% of total
+        overall_progress = int(base_progress + (step_progress * stage_weight))
+
+        # Update DynamoDB
+        table.update_item(
+            Key={'jobId': job_id},
+            UpdateExpression="SET #s = :status, current_stage = :stage, overall_progress = :op, steps.#step = :step_data",
+            ExpressionAttributeNames={
+                '#s': 'status',
+                '#step': 'gaussian_splat'
+            },
+            ExpressionAttributeValues={
+                ':status': 'RUNNING',
+                ':stage': 'GAUSSIAN_SPLAT',
+                ':op': overall_progress,
+                ':step_data': step_data
+            }
+        )
+        print(f"[DB Update] Iteration: {iteration}/{total_iterations} ({step_progress}%) | Overall: {overall_progress}%")
+    except Exception as e:
+        print(f"!! Error writing to DynamoDB: {e}")
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, job_id=None, enable_db_updates=False):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+
+    # Initialize DynamoDB connection if job_id is provided
+    dynamodb_table = None
+    if enable_db_updates and job_id:
+        try:
+            dynamodb = boto3.resource('dynamodb', region_name=REGION)
+            dynamodb_table = dynamodb.Table(TABLE_NAME)
+            print(f"DynamoDB connection established for job: {job_id}")
+        except Exception as e:
+            print(f"Warning: Could not connect to DynamoDB: {e}")
+            enable_db_updates = False
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -70,6 +131,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    
+    # Initial DB update
+    if enable_db_updates and dynamodb_table:
+        update_db(dynamodb_table, job_id, first_iter, opt.iterations, "Starting training")
+    
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -154,11 +220,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            # Update DynamoDB periodically
+            if enable_db_updates and dynamodb_table and iteration % UPDATE_INTERVAL == 0:
+                update_db(dynamodb_table, job_id, iteration, opt.iterations, 
+                         f"Loss: {ema_loss_for_log:.4f}")
+
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                # Update DB on checkpoint save
+                if enable_db_updates and dynamodb_table:
+                    update_db(dynamodb_table, job_id, iteration, opt.iterations, 
+                             f"Checkpoint saved")
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -188,6 +263,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    # Final DB update on completion
+    if enable_db_updates and dynamodb_table:
+        update_db(dynamodb_table, job_id, opt.iterations, opt.iterations, "Training completed")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -267,6 +346,8 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--job_id", type=str, default=None, help="Job ID for DynamoDB tracking")
+    parser.add_argument("--enable_db_updates", action='store_true', default=False, help="Enable DynamoDB progress updates")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -279,7 +360,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.job_id, args.enable_db_updates)
 
     # All done
     print("\nTraining complete.")
